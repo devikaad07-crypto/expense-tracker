@@ -1,10 +1,11 @@
 /**
  * app.js
  * Central Application Coordinator.
- * Connects storage.js, pure calculation modules, navigation, and UI rendering.
+ * Connects storage.js (API client), pure calculation modules, navigation, and UI rendering.
  */
 
 import { renderAnalyticsView } from './analytics.js';
+import { renderInsightsView } from './insights.js';
 import {
   calculateBudgetStatus,
   renderBudgetBannerHtml,
@@ -17,14 +18,17 @@ import {
   deleteTransaction,
   getBudgetForMonth,
   getCurrentMonthKey,
+  getLastApiError,
   getTodayDateString,
   getTransactions,
+  migrateLocalStorageIfNeeded,
   resetToSampleData,
   saveBudgetForMonth,
   seedInitialDataIfNeeded,
   updateTransaction,
 } from './storage.js';
 import {
+  escapeHtml,
   formatMonthLabel,
   openConfirmDeleteModal,
   openTransactionModal,
@@ -37,6 +41,7 @@ const VIEW_TITLES = {
   transactions: 'Transactions',
   analytics: 'Expense Analytics',
   budget: 'Budget Management',
+  insights: 'Smart Financial Insights',
 };
 
 const appState = {
@@ -45,6 +50,8 @@ const appState = {
   analyticsPeriod: '6m',
   transactions: [],
   monthlyBudget: 0,
+  leakThreshold: 200,
+  isLoading: false,
   filters: {
     search: '',
     type: 'all',
@@ -70,6 +77,7 @@ function refreshIcons() {
  */
 function showToast(message, variant = 'info') {
   const region = document.getElementById('toast-region');
+  if (!region) return;
   const toast = document.createElement('div');
   toast.className = `toast-item${variant === 'error' ? ' is-error' : ''}`;
   toast.textContent = message;
@@ -77,22 +85,72 @@ function showToast(message, variant = 'info') {
 
   window.setTimeout(() => {
     toast.remove();
-  }, 3000);
+  }, 3500);
 }
 
 /**
- * Reloads transactions and active month budget from storage.js.
+ * Renders or removes a persistent error banner when the backend is unreachable.
+ * Uses existing alert-banner styling.
  */
-function syncDataFromStorage() {
-  appState.transactions = getTransactions();
-  appState.monthlyBudget = getBudgetForMonth(appState.activeMonth);
+function renderApiErrorBanner(errorMessage) {
+  let errorEl = document.getElementById('global-api-error');
+  if (!errorMessage) {
+    if (errorEl) errorEl.remove();
+    return;
+  }
+  if (!errorEl) {
+    errorEl = document.createElement('div');
+    errorEl.id = 'global-api-error';
+    errorEl.className = 'alert-banner alert-banner-exceeded';
+    errorEl.setAttribute('role', 'alert');
+    errorEl.style.margin = '16px 24px 0';
+    const mainContent = document.getElementById('main-content');
+    if (mainContent && mainContent.parentElement) {
+      mainContent.parentElement.insertBefore(errorEl, mainContent);
+    }
+  }
+  errorEl.innerHTML = `
+    <div class="alert-banner-content">
+      <i data-lucide="alert-octagon" class="alert-banner-icon" aria-hidden="true"></i>
+      <div>
+        <strong>Server Connection Error:</strong> ${escapeHtml(errorMessage)}
+      </div>
+    </div>
+  `;
+  refreshIcons();
+}
+
+/**
+ * Renders a loading state indicator in table containers while data is being fetched.
+ */
+function showLoadingState() {
+  const loadingHtml = `
+    <div class="empty-state">
+      <i data-lucide="loader-2" class="empty-state-icon" aria-hidden="true"></i>
+      <h3 class="empty-state-title">Loading data...</h3>
+      <p class="empty-state-desc">Fetching financial records from the database.</p>
+    </div>
+  `;
+  const recentContainer = document.getElementById('dashboard-recent-container');
+  const tableContainer = document.getElementById('transactions-table-container');
+  if (recentContainer) recentContainer.innerHTML = loadingHtml;
+  if (tableContainer) tableContainer.innerHTML = loadingHtml;
+  refreshIcons();
+}
+
+/**
+ * Reloads transactions and active month budget from the REST API.
+ */
+async function syncDataFromStorage() {
+  appState.transactions = await getTransactions();
+  appState.monthlyBudget = await getBudgetForMonth(appState.activeMonth);
 }
 
 /**
  * Switches the active view section and updates sidebar & topbar navigation state.
  * @param {'dashboard'|'transactions'|'analytics'|'budget'} viewName
  */
-function navigateTo(viewName) {
+async function navigateTo(viewName) {
   if (!VIEW_TITLES[viewName]) return;
   appState.activeView = viewName;
 
@@ -116,7 +174,7 @@ function navigateTo(viewName) {
     VIEW_TITLES[viewName];
 
   closeMobileSidebar();
-  renderApplication();
+  await renderApplication();
 }
 
 /**
@@ -192,10 +250,12 @@ function exportTransactionsCsv() {
 }
 
 /**
- * Renders the active view and global budget indicators.
+ * Renders the active view and global budget indicators using database records.
  */
-function renderApplication() {
-  syncDataFromStorage();
+async function renderApplication() {
+  renderApiErrorBanner(getLastApiError());
+  await syncDataFromStorage();
+  renderApiErrorBanner(getLastApiError());
 
   const budgetStatus = calculateBudgetStatus(
     appState.transactions,
@@ -216,13 +276,17 @@ function renderApplication() {
     onEdit: (tx) =>
       openTransactionModal('edit', tx, getTodayDateString()),
     onDelete: (tx) => {
-      openConfirmDeleteModal(tx, () => {
-        deleteTransaction(tx.id);
-        renderApplication();
-        showToast('Transaction deleted.');
+      openConfirmDeleteModal(tx, async () => {
+        try {
+          await deleteTransaction(tx.id);
+          await renderApplication();
+          showToast('Transaction deleted.');
+        } catch (err) {
+          showToast(err.message || 'Failed to delete transaction.', 'error');
+        }
       });
     },
-    onResetFilters: () => {
+    onResetFilters: async () => {
       appState.filters = {
         search: '',
         type: 'all',
@@ -235,7 +299,7 @@ function renderApplication() {
       document.querySelectorAll('[data-filter-type]').forEach((btn) => {
         btn.classList.toggle('is-active', btn.dataset.filterType === 'all');
       });
-      renderApplication();
+      await renderApplication();
     },
   };
 
@@ -248,6 +312,14 @@ function renderApplication() {
     renderTransactionsView(renderState, txHandlers);
   } else if (appState.activeView === 'analytics') {
     renderAnalyticsView(renderState);
+  } else if (appState.activeView === 'insights') {
+    renderInsightsView(renderState, {
+      onThresholdChange: async (newThreshold) => {
+        appState.leakThreshold = newThreshold;
+        await renderApplication();
+        showToast(`Leak threshold updated to $${newThreshold}.`);
+      },
+    });
   }
 
   refreshIcons();
@@ -257,29 +329,40 @@ function renderApplication() {
  * Updates the active month across topbar, budget view, and charts.
  * @param {string} nextMonth
  */
-function handleMonthChange(nextMonth) {
+async function handleMonthChange(nextMonth) {
   if (!nextMonth || !/^\d{4}-\d{2}$/.test(nextMonth)) return;
   appState.activeMonth = nextMonth;
   document.getElementById('global-month-select').value = nextMonth;
-  renderApplication();
+  await renderApplication();
   showToast(`Switched active month to ${formatMonthLabel(nextMonth)}.`);
 }
 
 /**
  * Bootstraps the application on DOM ready.
  */
-function initApp() {
-  seedInitialDataIfNeeded();
+async function initApp() {
+  showLoadingState();
+
+  // 1. One-time LocalStorage migration
+  const migrationResult = await migrateLocalStorageIfNeeded();
+  if (migrationResult.migrated && (migrationResult.transactionsCount > 0 || migrationResult.budgetsCount > 0)) {
+    showToast(
+      `Imported ${migrationResult.transactionsCount} transactions and ${migrationResult.budgetsCount} budgets from LocalStorage.`
+    );
+  }
+
+  // 2. Seed initial starter dataset if database is empty
+  await seedInitialDataIfNeeded();
 
   const monthSelect = document.getElementById('global-month-select');
   monthSelect.value = appState.activeMonth;
-  monthSelect.addEventListener('change', (e) => {
-    if (e.target.value) handleMonthChange(e.target.value);
+  monthSelect.addEventListener('change', async (e) => {
+    if (e.target.value) await handleMonthChange(e.target.value);
   });
 
   // Sidebar navigation
   document.querySelectorAll('.nav-item[data-view]').forEach((btn) => {
-    btn.addEventListener('click', () => navigateTo(btn.dataset.view));
+    btn.addEventListener('click', async () => await navigateTo(btn.dataset.view));
   });
 
   // Mobile sidebar drawer
@@ -300,64 +383,81 @@ function initApp() {
   // Dashboard "View All" shortcut
   document
     .getElementById('btn-view-all-transactions')
-    .addEventListener('click', () => navigateTo('transactions'));
+    .addEventListener('click', async () => await navigateTo('transactions'));
 
   // Sidebar utility actions
   document
     .getElementById('btn-export-csv')
     .addEventListener('click', exportTransactionsCsv);
-  document.getElementById('btn-reset-demo').addEventListener('click', () => {
-    resetToSampleData();
-    appState.activeMonth = getCurrentMonthKey();
-    monthSelect.value = appState.activeMonth;
-    renderApplication();
-    showToast('Sample dataset restored.');
+
+  document.getElementById('btn-reset-demo').addEventListener('click', async () => {
+    try {
+      await resetToSampleData();
+      appState.activeMonth = getCurrentMonthKey();
+      monthSelect.value = appState.activeMonth;
+      await renderApplication();
+      showToast('Sample dataset restored to database.');
+    } catch (err) {
+      showToast(err.message || 'Failed to restore sample data.', 'error');
+    }
   });
 
   // Analytics period switch
   document.querySelectorAll('[data-analytics-period]').forEach((btn) => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       const period = btn.dataset.analyticsPeriod;
       appState.analyticsPeriod = period;
       document.querySelectorAll('[data-analytics-period]').forEach((b) => {
         b.classList.toggle('is-active', b.dataset.analyticsPeriod === period);
       });
-      renderApplication();
+      await renderApplication();
     });
   });
 
   // Setup transaction forms & filters
   setupTransactionForms({
     defaultDate: getTodayDateString(),
-    onCreate: (txData) => {
-      addTransaction(txData);
-      renderApplication();
-      showToast('Transaction added.');
+    onCreate: async (txData) => {
+      try {
+        await addTransaction(txData);
+        await renderApplication();
+        showToast('Transaction added.');
+      } catch (err) {
+        showToast(err.message || 'Failed to create transaction.', 'error');
+      }
     },
-    onUpdate: (id, updates) => {
-      updateTransaction(id, updates);
-      renderApplication();
-      showToast('Transaction updated.');
+    onUpdate: async (id, updates) => {
+      try {
+        await updateTransaction(id, updates);
+        await renderApplication();
+        showToast('Transaction updated.');
+      } catch (err) {
+        showToast(err.message || 'Failed to update transaction.', 'error');
+      }
     },
-    onFilterChange: (partialFilters) => {
+    onFilterChange: async (partialFilters) => {
       appState.filters = { ...appState.filters, ...partialFilters };
-      renderApplication();
+      await renderApplication();
     },
   });
 
   // Setup budget form
   setupBudgetForm({
     onMonthChange: handleMonthChange,
-    onSaveBudget: (monthKey, amount) => {
-      saveBudgetForMonth(monthKey, amount);
-      appState.activeMonth = monthKey;
-      monthSelect.value = monthKey;
-      renderApplication();
-      showToast(`Monthly budget saved for ${formatMonthLabel(monthKey)}.`);
+    onSaveBudget: async (monthKey, amount) => {
+      try {
+        await saveBudgetForMonth(monthKey, amount);
+        appState.activeMonth = monthKey;
+        monthSelect.value = monthKey;
+        await renderApplication();
+        showToast(`Monthly budget saved for ${formatMonthLabel(monthKey)}.`);
+      } catch (err) {
+        showToast(err.message || 'Failed to save budget.', 'error');
+      }
     },
   });
 
-  renderApplication();
+  await renderApplication();
 }
 
 document.addEventListener('DOMContentLoaded', initApp);

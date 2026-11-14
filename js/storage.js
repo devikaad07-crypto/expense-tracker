@@ -1,20 +1,16 @@
 /**
  * storage.js
- * Centralized LocalStorage Data Access Layer.
- *
- * Future Backend Integration Note:
- * All persistence operations are isolated here. When migrating to Node.js,
- * Express.js, and SQL, replace the synchronous localStorage reads/writes in
- * these exported functions with async fetch() calls to REST endpoints
- * (e.g., GET/POST /api/transactions, PUT/DELETE /api/transactions/:id,
- * GET/PUT /api/budgets/:month). UI and calculation modules do not access
- * localStorage directly.
+ * Centralized Data Access Layer connected to Node.js + Express + SQLite backend.
+ * All persistence is handled via REST API endpoints (/api/transactions, /api/budgets).
  */
+
+const API_BASE = '/api';
 
 const STORAGE_KEYS = {
   TRANSACTIONS: 'clearledger_transactions_v1',
   BUDGETS: 'clearledger_budgets_v1',
   INITIALIZED: 'clearledger_initialized_v1',
+  MIGRATED: 'clearledger_migrated_v1',
 };
 
 /**
@@ -41,7 +37,7 @@ export function getCurrentMonthKey(dateObj = new Date()) {
 }
 
 /**
- * Generates a unique identifier for each transaction.
+ * Generates a unique identifier (retained for backward compatibility).
  * @returns {string}
  */
 export function generateTransactionId() {
@@ -52,463 +48,330 @@ export function generateTransactionId() {
 }
 
 /**
- * Normalizes a raw transaction object to the strict application schema.
- * @param {object} raw
- * @returns {object}
+ * Tracks backend connection status.
  */
-function normalizeTransaction(raw) {
-  return {
-    id: String(raw.id || generateTransactionId()),
-    title: String(raw.title || '').trim(),
-    amount: Number(Number(raw.amount || 0).toFixed(2)),
-    category: String(raw.category || 'Other').trim(),
-    type: raw.type === 'income' ? 'income' : 'expense',
-    date: String(raw.date || getTodayDateString()),
-    description: String(raw.description || '').trim(),
-  };
+let lastApiError = null;
+
+export function getLastApiError() {
+  return lastApiError;
+}
+
+export function clearLastApiError() {
+  lastApiError = null;
 }
 
 /**
- * Retrieves all stored transactions from LocalStorage.
- * @returns {Array<object>}
+ * Helper to execute fetch calls with error handling.
  */
-export function getTransactions() {
+async function apiRequest(endpoint, options = {}) {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.map(normalizeTransaction);
+    const url = `${API_BASE}${endpoint}`;
+    const res = await fetch(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+      ...options,
+    });
+
+    const data = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      const errorMsg = (data && data.error) || `Request failed with status ${res.status}`;
+      const error = new Error(errorMsg);
+      error.status = res.status;
+      error.data = data;
+      throw error;
+    }
+
+    lastApiError = null;
+    return data;
   } catch (err) {
-    console.error('Failed to read transactions from LocalStorage:', err);
+    console.error(`API Error on [${options.method || 'GET'}] ${endpoint}:`, err);
+    lastApiError = err.message || 'Cannot connect to backend server.';
+    throw err;
+  }
+}
+
+/**
+ * Retrieves all stored transactions from the database via REST API.
+ * @returns {Promise<Array<object>>}
+ */
+export async function getTransactions() {
+  try {
+    const response = await apiRequest('/transactions');
+    return Array.isArray(response.data) ? response.data : [];
+  } catch (err) {
     return [];
   }
 }
 
 /**
- * Persists the complete transactions array to LocalStorage.
- * @param {Array<object>} transactions
- * @returns {Array<object>}
- */
-export function saveTransactions(transactions) {
-  const normalized = Array.isArray(transactions)
-    ? transactions.map(normalizeTransaction)
-    : [];
-  try {
-    window.localStorage.setItem(
-      STORAGE_KEYS.TRANSACTIONS,
-      JSON.stringify(normalized)
-    );
-    window.localStorage.setItem(STORAGE_KEYS.INITIALIZED, 'true');
-  } catch (err) {
-    console.error('Failed to save transactions to LocalStorage:', err);
-  }
-  return normalized;
-}
-
-/**
- * Appends a new transaction record and persists it.
+ * Appends a new transaction record via REST API.
  * @param {object} transactionInput
- * @returns {object} Newly created transaction
+ * @returns {Promise<object>}
  */
-export function addTransaction(transactionInput) {
-  const list = getTransactions();
-  const created = normalizeTransaction({
-    ...transactionInput,
-    id: generateTransactionId(),
+export async function addTransaction(transactionInput) {
+  const response = await apiRequest('/transactions', {
+    method: 'POST',
+    body: JSON.stringify({
+      title: transactionInput.title,
+      amount: Number(transactionInput.amount),
+      category: transactionInput.category,
+      type: transactionInput.type,
+      date: transactionInput.date,
+      description: transactionInput.description || '',
+    }),
   });
-  list.unshift(created);
-  saveTransactions(list);
-  return created;
+  return response.data;
 }
 
 /**
- * Updates an existing transaction by ID and persists the change.
- * @param {string} id
+ * Updates an existing transaction by ID via REST API.
+ * @param {number|string} id
  * @param {object} updates
- * @returns {object|null} Updated transaction or null if not found
+ * @returns {Promise<object|null>}
  */
-export function updateTransaction(id, updates) {
-  const list = getTransactions();
-  const index = list.findIndex((item) => item.id === id);
-  if (index === -1) return null;
-
-  const updated = normalizeTransaction({
-    ...list[index],
-    ...updates,
-    id,
+export async function updateTransaction(id, updates) {
+  const response = await apiRequest(`/transactions/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      title: updates.title,
+      amount: Number(updates.amount),
+      category: updates.category,
+      type: updates.type,
+      date: updates.date,
+      description: updates.description || '',
+    }),
   });
-  list[index] = updated;
-  saveTransactions(list);
-  return updated;
+  return response.data;
 }
 
 /**
- * Removes a transaction by ID and persists the updated list.
- * @param {string} id
- * @returns {boolean} True if removed
+ * Removes a transaction by ID via REST API.
+ * @param {number|string} id
+ * @returns {Promise<boolean>}
  */
-export function deleteTransaction(id) {
-  const list = getTransactions();
-  const filtered = list.filter((item) => item.id !== id);
-  if (filtered.length === list.length) return false;
-  saveTransactions(filtered);
+export async function deleteTransaction(id) {
+  await apiRequest(`/transactions/${id}`, {
+    method: 'DELETE',
+  });
   return true;
 }
 
 /**
- * Retrieves the budget map ({ "YYYY-MM": number, default: number }).
- * @returns {Record<string, number>}
- */
-export function getBudgets() {
-  try {
-    const raw = window.localStorage.getItem(STORAGE_KEYS.BUDGETS);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch (err) {
-    console.error('Failed to read budgets from LocalStorage:', err);
-    return {};
-  }
-}
-
-/**
- * Retrieves the monthly budget limit for a given YYYY-MM month key.
- * Falls back to the stored default budget if a month-specific limit is not set.
+ * Retrieves the monthly budget limit for a given YYYY-MM month key via REST API.
  * @param {string} monthKey
- * @returns {number}
+ * @returns {Promise<number>}
  */
-export function getBudgetForMonth(monthKey) {
-  const budgets = getBudgets();
-  if (typeof budgets[monthKey] === 'number' && budgets[monthKey] > 0) {
-    return budgets[monthKey];
+export async function getBudgetForMonth(monthKey) {
+  if (!monthKey || !/^\d{4}-\d{2}$/.test(monthKey)) return 0;
+  const [yearStr, monthStr] = monthKey.split('-');
+  const year = parseInt(yearStr, 10);
+  const month = parseInt(monthStr, 10);
+
+  try {
+    const response = await apiRequest(`/budgets/${year}/${month}`);
+    if (response && response.data && typeof response.data.amount === 'number') {
+      return response.data.amount;
+    }
+    return 0;
+  } catch (err) {
+    // 404 means no budget has been set yet for this month
+    if (err.status === 404) {
+      return 0;
+    }
+    return 0;
   }
-  if (typeof budgets.default === 'number' && budgets.default > 0) {
-    return budgets.default;
-  }
-  return 0;
 }
 
 /**
- * Saves the monthly budget limit for a given YYYY-MM month key.
- * Also stores it as the latest default for future months without explicit limits.
+ * Saves the monthly budget limit for a given YYYY-MM month key via REST API.
+ * Creates or updates the budget in SQLite.
  * @param {string} monthKey
  * @param {number} amount
- * @returns {number}
+ * @returns {Promise<number>}
  */
-export function saveBudgetForMonth(monthKey, amount) {
+export async function saveBudgetForMonth(monthKey, amount) {
+  const [yearStr, monthStr] = monthKey.split('-');
+  const year = parseInt(yearStr, 10);
+  const month = parseInt(monthStr, 10);
   const cleanAmount = Number(Number(amount).toFixed(2));
-  const budgets = getBudgets();
-  budgets[monthKey] = cleanAmount;
-  budgets.default = cleanAmount;
+
+  // Check if a budget already exists for this month
+  let existingBudget = null;
   try {
-    window.localStorage.setItem(STORAGE_KEYS.BUDGETS, JSON.stringify(budgets));
+    const res = await apiRequest(`/budgets/${year}/${month}`);
+    if (res && res.data) {
+      existingBudget = res.data;
+    }
   } catch (err) {
-    console.error('Failed to save budget to LocalStorage:', err);
+    // Not found is expected for new months
   }
+
+  if (existingBudget && existingBudget.id) {
+    await apiRequest(`/budgets/${existingBudget.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({ amount: cleanAmount }),
+    });
+  } else {
+    await apiRequest('/budgets', {
+      method: 'POST',
+      body: JSON.stringify({ year, month, amount: cleanAmount }),
+    });
+  }
+
   return cleanAmount;
 }
 
 /**
- * Helper to offset YYYY-MM by delta months.
- * @param {string} monthKey
- * @param {number} delta
- * @returns {string}
+ * One-time Migration:
+ * Reads existing LocalStorage transactions & budgets and migrates them to the SQLite database.
+ * Sets `clearledger_migrated_v1` flag so it never runs twice.
+ * Leaves the original LocalStorage data untouched as backup.
+ * @returns {Promise<{ migrated: boolean, transactionsCount: number, budgetsCount: number }>}
  */
-function shiftMonthKey(monthKey, delta) {
-  const [y, m] = monthKey.split('-').map(Number);
-  const d = new Date(y, m - 1 + delta, 1);
-  return getCurrentMonthKey(d);
+export async function migrateLocalStorageIfNeeded() {
+  try {
+    const isMigrated = window.localStorage.getItem(STORAGE_KEYS.MIGRATED);
+    if (isMigrated === 'true') {
+      return { migrated: false, transactionsCount: 0, budgetsCount: 0 };
+    }
+
+    let txCount = 0;
+    let bgCount = 0;
+
+    // 1. Migrate LocalStorage Transactions
+    const rawTx = window.localStorage.getItem(STORAGE_KEYS.TRANSACTIONS);
+    if (rawTx) {
+      try {
+        const parsedTx = JSON.parse(rawTx);
+        if (Array.isArray(parsedTx) && parsedTx.length > 0) {
+          for (const item of parsedTx) {
+            try {
+              await addTransaction({
+                title: item.title,
+                amount: item.amount,
+                category: item.category,
+                type: item.type,
+                date: item.date,
+                description: item.description,
+              });
+              txCount++;
+            } catch (err) {
+              console.warn('Skipping invalid migration item:', item, err);
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Failed to parse LocalStorage transactions for migration:', e);
+      }
+    }
+
+    // 2. Migrate LocalStorage Budgets
+    const rawBudgets = window.localStorage.getItem(STORAGE_KEYS.BUDGETS);
+    if (rawBudgets) {
+      try {
+        const parsedBudgets = JSON.parse(rawBudgets);
+        if (parsedBudgets && typeof parsedBudgets === 'object') {
+          for (const [key, val] of Object.entries(parsedBudgets)) {
+            if (/^\d{4}-\d{2}$/.test(key) && typeof val === 'number' && val > 0) {
+              try {
+                await saveBudgetForMonth(key, val);
+                bgCount++;
+              } catch (err) {
+                console.warn('Skipping budget migration item:', key, val, err);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error('Failed to parse LocalStorage budgets for migration:', e);
+      }
+    }
+
+    // Mark migration completed
+    window.localStorage.setItem(STORAGE_KEYS.MIGRATED, 'true');
+    console.log(`[Migration] Successfully imported ${txCount} transactions and ${bgCount} budgets into SQLite database.`);
+    return { migrated: true, transactionsCount: txCount, budgetsCount: bgCount };
+  } catch (err) {
+    console.error('[Migration] Failed to migrate LocalStorage data:', err);
+    return { migrated: false, transactionsCount: 0, budgetsCount: 0 };
+  }
 }
 
 /**
- * Builds realistic starter dataset anchored to the current month.
- * @returns {{ transactions: Array<object>, budgetAmount: number }}
+ * Builds starter dataset anchored to the current month.
  */
 function buildSampleDataset() {
   const m0 = getCurrentMonthKey();
-  const m1 = shiftMonthKey(m0, -1);
-  const m2 = shiftMonthKey(m0, -2);
-  const m3 = shiftMonthKey(m0, -3);
-  const m4 = shiftMonthKey(m0, -4);
-  const m5 = shiftMonthKey(m0, -5);
-
-  const transactions = [
-    // Current month (m0)
-    {
-      id: generateTransactionId(),
-      title: 'Monthly Salary Deposit',
-      amount: 5400,
-      category: 'Salary',
-      type: 'income',
-      date: `${m0}-01`,
-      description: 'Primary payroll direct deposit',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Apartment Lease',
-      amount: 1450,
-      category: 'Housing',
-      type: 'expense',
-      date: `${m0}-02`,
-      description: 'Monthly rent payment',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Grocery Shopping',
-      amount: 215.4,
-      category: 'Food',
-      type: 'expense',
-      date: `${m0}-05`,
-      description: 'Weekly groceries and produce',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Electric & Fiber Internet',
-      amount: 148.9,
-      category: 'Utilities',
-      type: 'expense',
-      date: `${m0}-07`,
-      description: 'Monthly utility and broadband bills',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'UI Audit Freelance Retainer',
-      amount: 850,
-      category: 'Freelance',
-      type: 'income',
-      date: `${m0}-08`,
-      description: 'Design system consultation milestone',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Transit Pass & Fuel',
-      amount: 112.5,
-      category: 'Transport',
-      type: 'expense',
-      date: `${m0}-10`,
-      description: 'Monthly commuter pass and fuel',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Pharmacy & Dental Checkup',
-      amount: 135,
-      category: 'Healthcare',
-      type: 'expense',
-      date: `${m0}-11`,
-      description: 'Routine checkup copay',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Specialty Coffee & Lunch',
-      amount: 78.2,
-      category: 'Food',
-      type: 'expense',
-      date: `${m0}-12`,
-      description: 'Neighborhood bistro and cafe',
-    },
-
-    // Previous months (m1 - m5)
-    {
-      id: generateTransactionId(),
-      title: 'Monthly Salary Deposit',
-      amount: 5400,
-      category: 'Salary',
-      type: 'income',
-      date: `${m1}-01`,
-      description: 'Primary payroll direct deposit',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Apartment Lease',
-      amount: 1450,
-      category: 'Housing',
-      type: 'expense',
-      date: `${m1}-02`,
-      description: 'Monthly rent payment',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Organic Market Groceries',
-      amount: 468.3,
-      category: 'Food',
-      type: 'expense',
-      date: `${m1}-11`,
-      description: 'Monthly household groceries',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Autumn Jacket & Footwear',
-      amount: 289,
-      category: 'Shopping',
-      type: 'expense',
-      date: `${m1}-16`,
-      description: 'Seasonal wardrobe essentials',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Streaming & Concert Tickets',
-      amount: 164,
-      category: 'Entertainment',
-      type: 'expense',
-      date: `${m1}-22`,
-      description: 'Live acoustic show and subscriptions',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Monthly Salary Deposit',
-      amount: 5400,
-      category: 'Salary',
-      type: 'income',
-      date: `${m2}-01`,
-      description: 'Primary payroll direct deposit',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Apartment Lease',
-      amount: 1450,
-      category: 'Housing',
-      type: 'expense',
-      date: `${m2}-02`,
-      description: 'Monthly rent payment',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Annual Tech Conference',
-      amount: 420,
-      category: 'Education',
-      type: 'expense',
-      date: `${m2}-14`,
-      description: 'Workshop pass and reference books',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Supermarket & Dining',
-      amount: 512.75,
-      category: 'Food',
-      type: 'expense',
-      date: `${m2}-19`,
-      description: 'Groceries and weekend dinner',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Monthly Salary Deposit',
-      amount: 5200,
-      category: 'Salary',
-      type: 'income',
-      date: `${m3}-01`,
-      description: 'Primary payroll direct deposit',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Quarterly Dividend Payout',
-      amount: 340,
-      category: 'Investments',
-      type: 'income',
-      date: `${m3}-15`,
-      description: 'Index fund distribution',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Apartment Lease & Utilities',
-      amount: 1610,
-      category: 'Housing',
-      type: 'expense',
-      date: `${m3}-03`,
-      description: 'Rent and municipal water',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Regional Rail & Rideshare',
-      amount: 275,
-      category: 'Transport',
-      type: 'expense',
-      date: `${m3}-20`,
-      description: 'Weekend regional travel',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Monthly Salary Deposit',
-      amount: 5200,
-      category: 'Salary',
-      type: 'income',
-      date: `${m4}-01`,
-      description: 'Primary payroll direct deposit',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Apartment Lease',
-      amount: 1450,
-      category: 'Housing',
-      type: 'expense',
-      date: `${m4}-02`,
-      description: 'Monthly rent payment',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Groceries & Utilities',
-      amount: 645,
-      category: 'Food',
-      type: 'expense',
-      date: `${m4}-14`,
-      description: 'Household food and power',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Monthly Salary Deposit',
-      amount: 5200,
-      category: 'Salary',
-      type: 'income',
-      date: `${m5}-01`,
-      description: 'Primary payroll direct deposit',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Apartment Lease',
-      amount: 1450,
-      category: 'Housing',
-      type: 'expense',
-      date: `${m5}-02`,
-      description: 'Monthly rent payment',
-    },
-    {
-      id: generateTransactionId(),
-      title: 'Home Office Desk Lamp & Chair',
-      amount: 495,
-      category: 'Shopping',
-      type: 'expense',
-      date: `${m5}-18`,
-      description: 'Workspace ergonomics upgrade',
-    },
-  ];
-
-  return {
-    transactions,
-    budgetAmount: 3000,
+  const shift = (delta) => {
+    const [y, m] = m0.split('-').map(Number);
+    const d = new Date(y, m - 1 + delta, 1);
+    return getCurrentMonthKey(d);
   };
+  const m1 = shift(-1);
+  const m2 = shift(-2);
+  const m3 = shift(-3);
+  const m4 = shift(-4);
+  const m5 = shift(-5);
+
+  return [
+    { title: 'Monthly Salary Deposit', amount: 5400, category: 'Salary', type: 'income', date: `${m0}-01`, description: 'Primary payroll direct deposit' },
+    { title: 'Apartment Lease', amount: 1450, category: 'Housing', type: 'expense', date: `${m0}-02`, description: 'Monthly rent payment' },
+    { title: 'Grocery Shopping', amount: 215.4, category: 'Food', type: 'expense', date: `${m0}-05`, description: 'Weekly groceries and produce' },
+    { title: 'Electric & Fiber Internet', amount: 148.9, category: 'Utilities', type: 'expense', date: `${m0}-07`, description: 'Monthly utility and broadband bills' },
+    { title: 'UI Audit Freelance Retainer', amount: 850, category: 'Freelance', type: 'income', date: `${m0}-08`, description: 'Design system consultation milestone' },
+    { title: 'Transit Pass & Fuel', amount: 112.5, category: 'Transport', type: 'expense', date: `${m0}-10`, description: 'Monthly commuter pass and fuel' },
+    { title: 'Pharmacy & Dental Checkup', amount: 135, category: 'Healthcare', type: 'expense', date: `${m0}-11`, description: 'Routine checkup copay' },
+    { title: 'Specialty Coffee & Lunch', amount: 78.2, category: 'Food', type: 'expense', date: `${m0}-12`, description: 'Neighborhood bistro and cafe' },
+    { title: 'Monthly Salary Deposit', amount: 5400, category: 'Salary', type: 'income', date: `${m1}-01`, description: 'Primary payroll direct deposit' },
+    { title: 'Apartment Lease', amount: 1450, category: 'Housing', type: 'expense', date: `${m1}-02`, description: 'Monthly rent payment' },
+    { title: 'Organic Market Groceries', amount: 468.3, category: 'Food', type: 'expense', date: `${m1}-11`, description: 'Monthly household groceries' },
+    { title: 'Autumn Jacket & Footwear', amount: 289, category: 'Shopping', type: 'expense', date: `${m1}-16`, description: 'Seasonal wardrobe essentials' },
+    { title: 'Streaming & Concert Tickets', amount: 164, category: 'Entertainment', type: 'expense', date: `${m1}-22`, description: 'Live acoustic show and subscriptions' },
+    { title: 'Monthly Salary Deposit', amount: 5400, category: 'Salary', type: 'income', date: `${m2}-01`, description: 'Primary payroll direct deposit' },
+    { title: 'Apartment Lease', amount: 1450, category: 'Housing', type: 'expense', date: `${m2}-02`, description: 'Monthly rent payment' },
+    { title: 'Annual Tech Conference', amount: 420, category: 'Education', type: 'expense', date: `${m2}-14`, description: 'Workshop pass and reference books' },
+    { title: 'Supermarket & Dining', amount: 512.75, category: 'Food', type: 'expense', date: `${m2}-19`, description: 'Groceries and weekend dinner' },
+    { title: 'Monthly Salary Deposit', amount: 5200, category: 'Salary', type: 'income', date: `${m3}-01`, description: 'Primary payroll direct deposit' },
+    { title: 'Quarterly Dividend Payout', amount: 340, category: 'Investments', type: 'income', date: `${m3}-15`, description: 'Index fund distribution' },
+    { title: 'Apartment Lease & Utilities', amount: 1610, category: 'Housing', type: 'expense', date: `${m3}-03`, description: 'Rent and municipal water' },
+    { title: 'Regional Rail & Rideshare', amount: 275, category: 'Transport', type: 'expense', date: `${m3}-20`, description: 'Weekend regional travel' },
+    { title: 'Monthly Salary Deposit', amount: 5200, category: 'Salary', type: 'income', date: `${m4}-01`, description: 'Primary payroll direct deposit' },
+    { title: 'Apartment Lease', amount: 1450, category: 'Housing', type: 'expense', date: `${m4}-02`, description: 'Monthly rent payment' },
+    { title: 'Groceries & Utilities', amount: 645, category: 'Food', type: 'expense', date: `${m4}-14`, description: 'Household food and power' },
+    { title: 'Monthly Salary Deposit', amount: 5200, category: 'Salary', type: 'income', date: `${m5}-01`, description: 'Primary payroll direct deposit' },
+    { title: 'Apartment Lease', amount: 1450, category: 'Housing', type: 'expense', date: `${m5}-02`, description: 'Monthly rent payment' },
+    { title: 'Home Office Desk Lamp & Chair', amount: 495, category: 'Shopping', type: 'expense', date: `${m5}-18`, description: 'Workspace ergonomics upgrade' },
+  ];
 }
 
 /**
- * Seeds sample data strictly once on first visit (never overwrites user clears).
+ * Seeds sample data into the database if the database is currently empty.
  */
-export function seedInitialDataIfNeeded() {
+export async function seedInitialDataIfNeeded() {
   try {
-    const initialized = window.localStorage.getItem(STORAGE_KEYS.INITIALIZED);
-    if (initialized === 'true') return;
-
-    const sample = buildSampleDataset();
-    saveTransactions(sample.transactions);
-    saveBudgetForMonth(getCurrentMonthKey(), sample.budgetAmount);
+    const existing = await getTransactions();
+    if (existing.length === 0) {
+      const sample = buildSampleDataset();
+      for (const item of sample) {
+        await addTransaction(item);
+      }
+      await saveBudgetForMonth(getCurrentMonthKey(), 3000);
+    }
   } catch (err) {
     console.error('Failed to seed initial data:', err);
   }
 }
 
 /**
- * Restores sample dataset on explicit user request.
+ * Restores sample dataset to the database.
  */
-export function resetToSampleData() {
+export async function resetToSampleData() {
   const sample = buildSampleDataset();
-  saveTransactions(sample.transactions);
-  saveBudgetForMonth(getCurrentMonthKey(), sample.budgetAmount);
+  for (const item of sample) {
+    await addTransaction(item);
+  }
+  await saveBudgetForMonth(getCurrentMonthKey(), 3000);
 }
